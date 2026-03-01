@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 github-work-summary
-Fetches all PRs you authored in a GitHub org and generates a Markdown summary.
+Fetches all PRs you authored in a GitHub org and generates a resume-quality
+Markdown summary using Claude to synthesize accomplishments by theme.
 """
 
 import os
@@ -9,6 +10,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+import anthropic
 import requests
 from dotenv import load_dotenv
 
@@ -19,6 +21,7 @@ GITHUB_ORG = os.getenv("GITHUB_ORG", "")
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "")
 SINCE_DATE = os.getenv("SINCE_DATE", "")   # optional: YYYY-MM-DD
 UNTIL_DATE = os.getenv("UNTIL_DATE", "")   # optional: YYYY-MM-DD
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 
 GRAPHQL_URL = "https://api.github.com/graphql"
 
@@ -37,6 +40,7 @@ query($searchQuery: String!, $cursor: String) {
         url
         number
         state
+        body
         createdAt
         mergedAt
         repository {
@@ -92,7 +96,7 @@ def fetch_all_prs() -> list[dict]:
         result = data["search"]
 
         for node in result["nodes"]:
-            if node:  # nodes can be null when type doesn't match
+            if node:
                 prs.append(node)
 
         if not result["pageInfo"]["hasNextPage"]:
@@ -101,7 +105,7 @@ def fetch_all_prs() -> list[dict]:
         cursor = result["pageInfo"]["endCursor"]
         page += 1
 
-    print()  # clear the \r line
+    print()
     return prs
 
 
@@ -112,7 +116,58 @@ def fmt_date(iso: str | None) -> str:
     return dt.strftime("%b %d, %Y")
 
 
-def generate_markdown(prs: list[dict]) -> str:
+def generate_resume_bullets(prs: list[dict]) -> str:
+    """Call Claude to synthesize PR data into themed resume bullet points."""
+    client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+    pr_lines = []
+    for pr in prs:
+        repo = pr["repository"]["nameWithOwner"]
+        title = pr["title"]
+        # Truncate long bodies to keep the prompt manageable
+        body = (pr.get("body") or "").strip()
+        body = body[:400] if len(body) > 400 else body
+        state = pr["state"]
+        labels = [lb["name"] for lb in pr.get("labels", {}).get("nodes", [])]
+
+        line = f"- [{state}] {repo}: {title}"
+        if labels:
+            line += f" (labels: {', '.join(labels)})"
+        if body:
+            line += f"\n  Description: {body}"
+        pr_lines.append(line)
+
+    pr_text = "\n".join(pr_lines)
+
+    prompt = f"""You are helping a software developer craft resume bullet points from their GitHub pull request history.
+
+Analyze these {len(prs)} pull requests and produce resume-quality accomplishment bullet points.
+
+Rules:
+- Identify 3–6 thematic headings that reflect the actual work (e.g. "Backend Development", "Infrastructure & DevOps", "Frontend", "Testing & Quality", "Developer Experience", "Data & Analytics") — only include themes that are genuinely represented
+- Write 2–5 bullets per theme
+- Every bullet starts with a strong past-tense action verb (Implemented, Designed, Migrated, Optimized, Refactored, Automated, Reduced, Improved, Built, Introduced, etc.)
+- Focus on impact and scope, not just what was changed
+- Quantify wherever the data supports it (number of services, repos, endpoints, percentage improvement, etc.)
+- Write at a senior engineer level — suitable for copying directly onto a resume or LinkedIn
+- Do NOT simply restate PR titles; synthesize and elevate the language
+
+Pull requests:
+{pr_text}
+
+Output only the Markdown (### headings and bullet points). No intro sentence, no outro.
+"""
+
+    message = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    return message.content[0].text
+
+
+def generate_markdown(prs: list[dict], resume_bullets: str) -> str:
     now = datetime.now().strftime("%Y-%m-%d")
 
     merged = [p for p in prs if p["state"] == "MERGED"]
@@ -122,7 +177,6 @@ def generate_markdown(prs: list[dict]) -> str:
     all_dates = sorted(p["createdAt"] for p in prs if p.get("createdAt"))
     date_range = f"{fmt_date(all_dates[0])} → {fmt_date(all_dates[-1])}" if all_dates else "N/A"
 
-    # Group by repo
     by_repo: dict[str, list[dict]] = {}
     for pr in prs:
         key = pr["repository"]["nameWithOwner"]
@@ -137,6 +191,23 @@ def generate_markdown(prs: list[dict]) -> str:
         "",
         "---",
         "",
+    ]
+
+    # --- Resume section (AI-generated) ---
+    if resume_bullets:
+        lines += [
+            "## Resume Bullets",
+            "",
+            "_Copy-paste ready. Grouped by theme, synthesized from your PR history._",
+            "",
+            resume_bullets.strip(),
+            "",
+            "---",
+            "",
+        ]
+
+    # --- Stats overview ---
+    lines += [
         "## Overview",
         "",
         "| | |",
@@ -165,7 +236,7 @@ def generate_markdown(prs: list[dict]) -> str:
         for pr in repo_prs_sorted:
             icon = STATE_ICON.get(pr["state"], "")
             date = fmt_date(pr.get("mergedAt") or pr.get("createdAt"))
-            labels = [l["name"] for l in pr.get("labels", {}).get("nodes", [])]
+            labels = [lb["name"] for lb in pr.get("labels", {}).get("nodes", [])]
             label_str = "  `" + "`  `".join(labels) + "`" if labels else ""
             lines.append(f"- {icon} [{pr['title']}]({pr['url']}) — {date}{label_str}")
 
@@ -208,8 +279,16 @@ def main() -> None:
     repo_count = len({p["repository"]["nameWithOwner"] for p in prs})
     print(f"Found {len(prs)} PRs across {repo_count} repositories.")
 
+    resume_bullets = ""
+    if ANTHROPIC_API_KEY:
+        print("Generating resume bullets with Claude...")
+        resume_bullets = generate_resume_bullets(prs)
+    else:
+        print("Warning: ANTHROPIC_API_KEY not set — skipping resume bullet generation.")
+        print("         Add it to your .env to enable AI-generated resume content.")
+
     print("Generating summary...")
-    markdown = generate_markdown(prs)
+    markdown = generate_markdown(prs, resume_bullets)
 
     filename = f"work-summary-{GITHUB_ORG}-{datetime.now().strftime('%Y%m%d')}.md"
     Path(filename).write_text(markdown, encoding="utf-8")
