@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 github-work-summary
-Fetches all PRs you authored in a GitHub org and generates a resume-quality
-Markdown summary using Claude to synthesize accomplishments by theme.
+Fetches all PRs you authored in a GitHub org or your personal repos and
+generates a resume-quality Markdown summary using Claude to synthesize
+accomplishments by theme.
 """
 
 import os
@@ -19,6 +20,7 @@ load_dotenv()
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_ORG = os.getenv("GITHUB_ORG", "")
 GITHUB_USERNAME = os.getenv("GITHUB_USERNAME", "")
+REPO_TYPE = os.getenv("REPO_TYPE", "org").lower()  # "org" or "user"
 SINCE_DATE = os.getenv("SINCE_DATE", "")   # optional: YYYY-MM-DD
 UNTIL_DATE = os.getenv("UNTIL_DATE", "")   # optional: YYYY-MM-DD
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -76,7 +78,10 @@ def run_query(query: str, variables: dict) -> dict:
 
 
 def build_search_query() -> str:
-    q = f"org:{GITHUB_ORG} author:{GITHUB_USERNAME} type:pr"
+    if REPO_TYPE == "user":
+        q = f"user:{GITHUB_USERNAME} author:{GITHUB_USERNAME} type:pr"
+    else:
+        q = f"org:{GITHUB_ORG} author:{GITHUB_USERNAME} type:pr"
     if SINCE_DATE:
         q += f" created:>={SINCE_DATE}"
     if UNTIL_DATE:
@@ -184,8 +189,9 @@ def generate_markdown(prs: list[dict], resume_bullets: str) -> str:
 
     sorted_repos = sorted(by_repo.items(), key=lambda x: len(x[1]), reverse=True)
 
+    scope = f"@ {GITHUB_ORG}" if REPO_TYPE == "org" else "(personal repos)"
     lines: list[str] = [
-        f"# Work Summary — @{GITHUB_USERNAME} @ {GITHUB_ORG}",
+        f"# Work Summary — @{GITHUB_USERNAME} {scope}",
         "",
         f"_Generated: {now}_",
         "",
@@ -261,10 +267,17 @@ def generate_markdown(prs: list[dict], resume_bullets: str) -> str:
 
 
 def main() -> None:
-    missing = [v for v in ("GITHUB_TOKEN", "GITHUB_ORG", "GITHUB_USERNAME") if not os.getenv(v)]
+    required = ["GITHUB_TOKEN", "GITHUB_USERNAME"]
+    if REPO_TYPE == "org":
+        required.append("GITHUB_ORG")
+    missing = [v for v in required if not os.getenv(v)]
     if missing:
         print(f"Error: missing required environment variables: {', '.join(missing)}")
         print("Copy .env.example to .env and fill in your values.")
+        sys.exit(1)
+
+    if REPO_TYPE not in ("org", "user"):
+        print(f"Error: REPO_TYPE must be 'org' or 'user', got '{REPO_TYPE}'")
         sys.exit(1)
 
     date_filter = ""
@@ -273,7 +286,10 @@ def main() -> None:
     if UNTIL_DATE:
         date_filter += f" until {UNTIL_DATE}"
 
-    print(f"Fetching PRs for @{GITHUB_USERNAME} in '{GITHUB_ORG}'{date_filter}...")
+    if REPO_TYPE == "user":
+        print(f"Fetching PRs for @{GITHUB_USERNAME} in personal repos{date_filter}...")
+    else:
+        print(f"Fetching PRs for @{GITHUB_USERNAME} in '{GITHUB_ORG}'{date_filter}...")
 
     prs = fetch_all_prs()
     repo_count = len({p["repository"]["nameWithOwner"] for p in prs})
@@ -290,7 +306,8 @@ def main() -> None:
     print("Generating summary...")
     markdown = generate_markdown(prs, resume_bullets)
 
-    filename = f"work-summary-{GITHUB_ORG}-{datetime.now().strftime('%Y%m%d')}.md"
+    scope_slug = GITHUB_ORG if REPO_TYPE == "org" else f"{GITHUB_USERNAME}-personal"
+    filename = f"work-summary-{scope_slug}-{datetime.now().strftime('%Y%m%d')}.md"
     Path(filename).write_text(markdown, encoding="utf-8")
     print(f"Saved: {filename}")
 
